@@ -1,19 +1,24 @@
-"""Local choices API backed by Qwen3-Reranker-0.6B."""
+"""Local choices and hierarchical categorization API backed by Qwen3-Reranker."""
 
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
 from threading import Lock
-from typing import Annotated, Callable
+from typing import Annotated, Any, Callable
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
 MODEL_DIR = Path(__file__).resolve().parent / "models" / "qwen3-reranker-0.6b"
 MODEL_NAME = "Qwen/Qwen3-Reranker-0.6B"
 INSTRUCTION = "Given a user query, determine whether the candidate response correctly answers the query."
+CATEGORY_INSTRUCTION = (
+    "Given a user text, determine whether the category name and description "
+    "accurately classify its main subject."
+)
 PREFIX = (
     '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query '
     'and the Instruct provided. Note that the answer can only be "yes" or "no".'
@@ -43,6 +48,35 @@ class ChoicesResponse(BaseModel):
     query: str
     model: str
     choices: list[ChoiceScore]
+
+
+class CategorizeRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=10_000)
+    categories: dict[str, Any] = Field(min_length=1, max_length=64)
+
+
+class CategoryScore(ChoiceScore):
+    description: str
+
+
+class CategoryLevel(BaseModel):
+    depth: int
+    selected: str
+    candidates: list[CategoryScore]
+
+
+class CategorizeResponse(BaseModel):
+    query: str
+    model: str
+    path: list[str]
+    levels: list[CategoryLevel]
+
+
+@dataclass
+class CategoryNode:
+    name: str
+    description: str
+    children: list["CategoryNode"]
 
 
 class QwenReranker:
@@ -85,14 +119,16 @@ class QwenReranker:
             raise ValueError("RERANKER_BATCH_SIZE must be positive")
         self.lock = Lock()
 
-    def score(self, query: str, choices: list[str]) -> list[tuple[float, float]]:
+    def score(
+        self, query: str, choices: list[str], instruction: str = INSTRUCTION
+    ) -> list[tuple[float, float]]:
         """Return one (yes logit, no logit) pair per choice, in input order."""
         results = []
         with self.lock, self.torch.inference_mode():
             for start in range(0, len(choices), self.batch_size):
                 batch = choices[start : start + self.batch_size]
                 pairs = [
-                    f"<Instruct>: {INSTRUCTION}\n<Query>: {query}\n<Document>: {choice}"
+                    f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {choice}"
                     for choice in batch
                 ]
                 tokenized = self.tokenizer(
@@ -146,19 +182,107 @@ def make_response(query: str, choices: list[str], logits: list[tuple[float, floa
     return ChoicesResponse(query=query, model=MODEL_NAME, choices=scores)
 
 
+def parse_categories(categories: dict[str, Any]) -> list[CategoryNode]:
+    """Parse {name: [description, {child_name: [...]}]} into bounded nodes."""
+    count = 0
+
+    def parse_level(mapping: dict[str, Any], depth: int) -> list[CategoryNode]:
+        nonlocal count
+        if depth >= 16:
+            raise ValueError("Category depth cannot exceed 16 levels")
+        if len(mapping) > 64:
+            raise ValueError("Each level can contain at most 64 categories")
+
+        nodes = []
+        for name, value in mapping.items():
+            count += 1
+            if count > 512:
+                raise ValueError("The tree can contain at most 512 categories")
+            if not isinstance(name, str) or not name.strip() or len(name) > 200:
+                raise ValueError("Category names must contain 1 to 200 characters")
+            if not isinstance(value, list) or not value:
+                raise ValueError(f"Category {name!r} must be [description, children...]")
+            description = value[0]
+            if (
+                not isinstance(description, str)
+                or not description.strip()
+                or len(description) > 10_000
+            ):
+                raise ValueError(f"Category {name!r} needs a nonempty description")
+
+            children = {}
+            for group in value[1:]:
+                if not isinstance(group, dict) or not group:
+                    raise ValueError(f"Children of {name!r} must be nonempty JSON objects")
+                for child_name, child_value in group.items():
+                    if child_name in children:
+                        raise ValueError(f"Duplicate child category {child_name!r} in {name!r}")
+                    children[child_name] = child_value
+            nodes.append(
+                CategoryNode(
+                    name=name,
+                    description=description,
+                    children=parse_level(children, depth + 1) if children else [],
+                )
+            )
+        return nodes
+
+    return parse_level(categories, 0)
+
+
+def categorize(query: str, roots: list[CategoryNode], ranker: QwenReranker) -> CategorizeResponse:
+    path = []
+    levels = []
+    current = roots
+    while current:
+        documents = [
+            f"Category: {' > '.join([*path, node.name])}\nDescription: {node.description}"
+            for node in current
+        ]
+        scores = make_response(
+            query,
+            documents,
+            ranker.score(query, documents, instruction=CATEGORY_INSTRUCTION),
+        ).choices
+        best_index = max(range(len(scores)), key=lambda index: scores[index].percentage)
+        candidates = [
+            CategoryScore(
+                **score.model_dump(exclude={"choice"}),
+                choice=node.name,
+                description=node.description,
+            )
+            for node, score in zip(current, scores)
+        ]
+        selected = current[best_index]
+        levels.append(
+            CategoryLevel(depth=len(path), selected=selected.name, candidates=candidates)
+        )
+        path.append(selected.name)
+        current = selected.children
+    return CategorizeResponse(query=query, model=MODEL_NAME, path=path, levels=levels)
+
+
 def create_app(ranker_factory: Callable[[], QwenReranker] = QwenReranker) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.ranker = ranker_factory()
         yield
 
-    app = FastAPI(title="Qwen choices API", lifespan=lifespan)
+    app = FastAPI(title="Qwen categorizer API", lifespan=lifespan)
 
     @app.post("/choices", response_model=ChoicesResponse)
     def rank_choices(body: ChoicesRequest, request: Request) -> ChoicesResponse:
         return make_response(
             body.query, body.choices, request.app.state.ranker.score(body.query, body.choices)
         )
+
+    @app.post("/categorize", response_model=CategorizeResponse)
+    def categorize_query(body: CategorizeRequest, request: Request) -> CategorizeResponse:
+        try:
+            roots = parse_categories(body.categories)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return categorize(body.query, roots, request.app.state.ranker)
 
     return app
 
