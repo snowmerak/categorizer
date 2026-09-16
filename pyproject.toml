@@ -1,0 +1,22 @@
+[project]
+name = "categorizer"
+version = "0.1.0"
+description = "Batch reranking choices API using Qwen3-Reranker-0.6B"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "huggingface-hub>=0.30",
+    "requests>=2.32",
+    "torch>=2.6",
+    "transformers>=4.51,<5",
+    "uvicorn>=0.30",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
