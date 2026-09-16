@@ -2,6 +2,8 @@
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import heapq
+from itertools import count
 import math
 import os
 from pathlib import Path
@@ -53,6 +55,7 @@ class ChoicesResponse(BaseModel):
 class CategorizeRequest(BaseModel):
     query: str = Field(min_length=1, max_length=10_000)
     categories: dict[str, Any] = Field(min_length=1, max_length=64)
+    top_k: int = Field(default=1, ge=1, le=10)
 
 
 class CategoryScore(ChoiceScore):
@@ -65,11 +68,17 @@ class CategoryLevel(BaseModel):
     candidates: list[CategoryScore]
 
 
+class RankedPath(BaseModel):
+    path: list[str]
+    percentage: float
+
+
 class CategorizeResponse(BaseModel):
     query: str
     model: str
     path: list[str]
     levels: list[CategoryLevel]
+    ranked_paths: list[RankedPath]
 
 
 @dataclass
@@ -154,15 +163,21 @@ class QwenReranker:
         return results
 
 
+def log_softmax_margins(logits: list[tuple[float, float]]) -> list[float]:
+    margins = [yes - no for yes, no in logits]
+    largest = max(margins)
+    log_total = largest + math.log(sum(math.exp(margin - largest) for margin in margins))
+    return [margin - log_total for margin in margins]
+
+
 def make_response(query: str, choices: list[str], logits: list[tuple[float, float]]) -> ChoicesResponse:
     if len(logits) != len(choices):
         raise ValueError("The model returned an unexpected number of scores")
-    margins = [yes - no for yes, no in logits]
-    largest = max(margins)
-    weights = [math.exp(margin - largest) for margin in margins]
-    total = sum(weights)
+    log_percentages = log_softmax_margins(logits)
     scores = []
-    for index, (choice, (yes, no), weight) in enumerate(zip(choices, logits, weights)):
+    for index, (choice, (yes, no), log_percentage) in enumerate(
+        zip(choices, logits, log_percentages)
+    ):
         # A two-class softmax is the independent yes/no judgment for this choice.
         reference = max(yes, no)
         yes_weight = math.exp(yes - reference)
@@ -176,7 +191,7 @@ def make_response(query: str, choices: list[str], logits: list[tuple[float, floa
                 no_logit=no,
                 yes_probability=yes_probability,
                 no_probability=no_weight / (yes_weight + no_weight),
-                percentage=100 * weight / total,
+                percentage=100 * math.exp(log_percentage),
             )
         )
     return ChoicesResponse(query=query, model=MODEL_NAME, choices=scores)
@@ -230,36 +245,69 @@ def parse_categories(categories: dict[str, Any]) -> list[CategoryNode]:
     return parse_level(categories, 0)
 
 
-def categorize(query: str, roots: list[CategoryNode], ranker: QwenReranker) -> CategorizeResponse:
-    path = []
-    levels = []
-    current = roots
-    while current:
+def categorize(
+    query: str, roots: list[CategoryNode], ranker: QwenReranker, top_k: int = 1
+) -> CategorizeResponse:
+    """Return the most likely leaves under sibling softmax path products."""
+    frontier = []
+    sequence = count()
+    scored_levels = {}
+
+    def add_children(path: tuple[str, ...], children: list[CategoryNode], parent_log: float):
         documents = [
             f"Category: {' > '.join([*path, node.name])}\nDescription: {node.description}"
-            for node in current
+            for node in children
         ]
+        logits = ranker.score(query, documents, instruction=CATEGORY_INSTRUCTION)
         scores = make_response(
             query,
             documents,
-            ranker.score(query, documents, instruction=CATEGORY_INSTRUCTION),
+            logits,
         ).choices
-        best_index = max(range(len(scores)), key=lambda index: scores[index].percentage)
-        candidates = [
+        scored_levels[path] = [
             CategoryScore(
                 **score.model_dump(exclude={"choice"}),
                 choice=node.name,
                 description=node.description,
             )
-            for node, score in zip(current, scores)
+            for node, score in zip(children, scores)
         ]
-        selected = current[best_index]
-        levels.append(
-            CategoryLevel(depth=len(path), selected=selected.name, candidates=candidates)
+        for node, log_probability in zip(children, log_softmax_margins(logits)):
+            child_path = (*path, node.name)
+            heapq.heappush(
+                frontier,
+                (-(parent_log + log_probability), next(sequence), node, child_path),
+            )
+
+    add_children((), roots, 0.0)
+    ranked_paths = []
+    # Every descendant has at most its ancestor's mass, so popped leaves are in rank order.
+    while frontier and len(ranked_paths) < top_k:
+        negative_log, _, node, path = heapq.heappop(frontier)
+        log_mass = -negative_log
+        if node.children:
+            add_children(path, node.children, log_mass)
+        else:
+            ranked_paths.append(
+                RankedPath(path=list(path), percentage=100 * math.exp(log_mass))
+            )
+
+    best_path = ranked_paths[0].path
+    levels = [
+        CategoryLevel(
+            depth=depth,
+            selected=name,
+            candidates=scored_levels[tuple(best_path[:depth])],
         )
-        path.append(selected.name)
-        current = selected.children
-    return CategorizeResponse(query=query, model=MODEL_NAME, path=path, levels=levels)
+        for depth, name in enumerate(best_path)
+    ]
+    return CategorizeResponse(
+        query=query,
+        model=MODEL_NAME,
+        path=best_path,
+        levels=levels,
+        ranked_paths=ranked_paths,
+    )
 
 
 def create_app(ranker_factory: Callable[[], QwenReranker] = QwenReranker) -> FastAPI:
@@ -282,7 +330,7 @@ def create_app(ranker_factory: Callable[[], QwenReranker] = QwenReranker) -> Fas
             roots = parse_categories(body.categories)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        return categorize(body.query, roots, request.app.state.ranker)
+        return categorize(body.query, roots, request.app.state.ranker, top_k=body.top_k)
 
     return app
 

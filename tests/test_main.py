@@ -1,8 +1,9 @@
 import unittest
+import math
 
 from pydantic import ValidationError
 
-from main import ChoicesRequest, categorize, make_response, parse_categories
+from main import CategorizeRequest, ChoicesRequest, categorize, make_response, parse_categories
 
 
 class ChoicesResponseTests(unittest.TestCase):
@@ -90,6 +91,52 @@ class CategorizationTests(unittest.TestCase):
         for categories in malformed:
             with self.subTest(categories=categories), self.assertRaises(ValueError):
                 parse_categories(categories)
+
+    def test_path_products_can_reverse_the_greedy_root_choice(self):
+        class BranchRanker:
+            def score(self, query, documents, instruction):
+                margins = {
+                    "A": math.log(1.5),
+                    "B": 0,
+                    "A > A1": 0,
+                    "A > A2": 0,
+                    "B > B1": 0,
+                }
+                return [
+                    (margins[document.splitlines()[0].removeprefix("Category: ")], 0)
+                    for document in documents
+                ]
+
+        roots = parse_categories(
+            {
+                "A": ["first branch", {"A1": ["leaf"], "A2": ["leaf"]}],
+                "B": ["second branch", {"B1": ["leaf"]}],
+            }
+        )
+
+        result = categorize("query", roots, BranchRanker(), top_k=2)
+
+        self.assertGreater(result.levels[0].candidates[0].percentage, 50)
+        self.assertEqual(result.path, ["B", "B1"])
+        self.assertEqual([item.path for item in result.ranked_paths], [["B", "B1"], ["A", "A1"]])
+        self.assertAlmostEqual(result.ranked_paths[0].percentage, 40)
+        self.assertAlmostEqual(result.ranked_paths[1].percentage, 30)
+
+    def test_unclassified_leaf_can_be_ranked(self):
+        class NoMatchRanker:
+            def score(self, query, documents, instruction):
+                return [(-3, 0), (3, 0)]
+
+        roots = parse_categories({"Animals": ["Animals"], "Unclassified": ["No category fits"]})
+        result = categorize("query", roots, NoMatchRanker())
+
+        self.assertEqual(result.path, ["Unclassified"])
+        self.assertEqual(result.ranked_paths[0].path, ["Unclassified"])
+
+    def test_top_k_is_bounded(self):
+        for top_k in (0, 11):
+            with self.subTest(top_k=top_k), self.assertRaises(ValidationError):
+                CategorizeRequest(query="query", categories={"A": ["description"]}, top_k=top_k)
 
 
 if __name__ == "__main__":
