@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
+    "hf-xet>=1.6.0",
     "huggingface-hub>=0.30",
-    "requests>=2.32",
     "torch>=2.6",
     "transformers>=4.51,<5",
     "uvicorn>=0.30",

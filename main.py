@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 from threading import Lock
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -56,6 +56,11 @@ class CategorizeRequest(BaseModel):
     query: str = Field(min_length=1, max_length=10_000)
     categories: dict[str, Any] = Field(min_length=1, max_length=64)
     top_k: int = Field(default=1, ge=1, le=10)
+    prefilter_top_n: int | None = Field(default=8, ge=1, le=64)
+    prefilter_min_siblings: int = Field(default=32, ge=2, le=64)
+    prefilter_keep_names: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        default_factory=lambda: ["분류불가", "Unclassified"], max_length=16
+    )
 
 
 class CategoryScore(ChoiceScore):
@@ -79,6 +84,8 @@ class CategorizeResponse(BaseModel):
     path: list[str]
     levels: list[CategoryLevel]
     ranked_paths: list[RankedPath]
+    search_mode: Literal["exact", "prefiltered"]
+    omitted_candidates: int
 
 
 @dataclass
@@ -246,18 +253,50 @@ def parse_categories(categories: dict[str, Any]) -> list[CategoryNode]:
 
 
 def categorize(
-    query: str, roots: list[CategoryNode], ranker: QwenReranker, top_k: int = 1
+    query: str,
+    roots: list[CategoryNode],
+    ranker: QwenReranker,
+    top_k: int = 1,
+    prefilter_top_n: int | None = None,
+    prefilter_min_siblings: int = 32,
+    prefilter_keep_names: set[str] | None = None,
+    embedder_factory: Callable[[], Any] | None = None,
 ) -> CategorizeResponse:
-    """Return the most likely leaves under sibling softmax path products."""
+    """Return top leaves by sibling softmax; prefiltering makes this approximate."""
     frontier = []
     sequence = count()
     scored_levels = {}
+    query_vector = None
+    omitted_candidates = 0
 
     def add_children(path: tuple[str, ...], children: list[CategoryNode], parent_log: float):
+        nonlocal query_vector, omitted_candidates
         documents = [
             f"Category: {' > '.join([*path, node.name])}\nDescription: {node.description}"
             for node in children
         ]
+        original_indices = list(range(len(children)))
+        if (
+            prefilter_top_n is not None
+            and len(children) >= prefilter_min_siblings
+            and len(children) > prefilter_top_n
+        ):
+            if embedder_factory is None:
+                raise ValueError("An embedder is required when prefiltering is enabled")
+            embedder = embedder_factory()
+            if query_vector is None:
+                query_vector = embedder.encode_query(query)
+            selected_indices = embedder.select(
+                query_vector,
+                documents,
+                [node.name for node in children],
+                prefilter_top_n,
+                prefilter_keep_names or set(),
+            )
+            omitted_candidates += len(children) - len(selected_indices)
+            original_indices = selected_indices
+            children = [children[index] for index in selected_indices]
+            documents = [documents[index] for index in selected_indices]
         logits = ranker.score(query, documents, instruction=CATEGORY_INSTRUCTION)
         scores = make_response(
             query,
@@ -266,11 +305,12 @@ def categorize(
         ).choices
         scored_levels[path] = [
             CategoryScore(
-                **score.model_dump(exclude={"choice"}),
+                **score.model_dump(exclude={"choice", "index"}),
+                index=original_index,
                 choice=node.name,
                 description=node.description,
             )
-            for node, score in zip(children, scores)
+            for original_index, node, score in zip(original_indices, children, scores)
         ]
         for node, log_probability in zip(children, log_softmax_margins(logits)):
             child_path = (*path, node.name)
@@ -307,16 +347,35 @@ def categorize(
         path=best_path,
         levels=levels,
         ranked_paths=ranked_paths,
+        search_mode="prefiltered" if omitted_candidates else "exact",
+        omitted_candidates=omitted_candidates,
     )
 
 
-def create_app(ranker_factory: Callable[[], QwenReranker] = QwenReranker) -> FastAPI:
+def create_app(
+    ranker_factory: Callable[[], QwenReranker] = QwenReranker,
+    embedder_factory: Callable[[], Any] | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.ranker = ranker_factory()
         yield
 
     app = FastAPI(title="Qwen categorizer API", lifespan=lifespan)
+    app.state.embedder = None
+    app.state.embedder_lock = Lock()
+
+    def get_embedder():
+        with app.state.embedder_lock:
+            if app.state.embedder is None:
+                from embedding import QwenEmbedder
+
+                factory = embedder_factory or QwenEmbedder
+                try:
+                    app.state.embedder = factory()
+                except FileNotFoundError as error:
+                    raise HTTPException(status_code=503, detail=str(error)) from error
+            return app.state.embedder
 
     @app.post("/choices", response_model=ChoicesResponse)
     def rank_choices(body: ChoicesRequest, request: Request) -> ChoicesResponse:
@@ -330,7 +389,16 @@ def create_app(ranker_factory: Callable[[], QwenReranker] = QwenReranker) -> Fas
             roots = parse_categories(body.categories)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        return categorize(body.query, roots, request.app.state.ranker, top_k=body.top_k)
+        return categorize(
+            body.query,
+            roots,
+            request.app.state.ranker,
+            top_k=body.top_k,
+            prefilter_top_n=body.prefilter_top_n,
+            prefilter_min_siblings=body.prefilter_min_siblings,
+            prefilter_keep_names=set(body.prefilter_keep_names),
+            embedder_factory=get_embedder,
+        )
 
     return app
 

@@ -43,8 +43,8 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "hf-xet" },
     { name = "huggingface-hub" },
-    { name = "requests" },
     { name = "torch" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -53,8 +53,8 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "hf-xet", specifier = ">=1.6.0" },
     { name = "huggingface-hub", specifier = ">=0.30" },
-    { name = "requests", specifier = ">=2.32" },
     { name = "torch", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu128" },
     { name = "transformers", specifier = ">=4.51,<5" },
     { name = "uvicorn", specifier = ">=0.30" },

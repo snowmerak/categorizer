@@ -133,10 +133,112 @@ class CategorizationTests(unittest.TestCase):
         self.assertEqual(result.path, ["Unclassified"])
         self.assertEqual(result.ranked_paths[0].path, ["Unclassified"])
 
+    def test_prefilter_scores_only_selected_candidates_and_keeps_named_leaf(self):
+        class RecordingRanker:
+            def __init__(self):
+                self.documents = []
+
+            def score(self, query, documents, instruction):
+                self.documents.extend(documents)
+                return [(1, 0) if "Unclassified" in doc else (0, 0) for doc in documents]
+
+        class SelectiveEmbedder:
+            def __init__(self):
+                self.queries = []
+
+            def encode_query(self, query):
+                self.queries.append(query)
+                return query
+
+            def select(self, query_vector, documents, names, top_n, keep_names):
+                self.assertion = (query_vector, top_n, keep_names)
+                return [0, 3]
+
+        roots = parse_categories(
+            {"A": ["a"], "B": ["b"], "C": ["c"], "Unclassified": ["none fit"]}
+        )
+        ranker = RecordingRanker()
+        embedder = SelectiveEmbedder()
+        result = categorize(
+            "query",
+            roots,
+            ranker,
+            top_k=2,
+            prefilter_top_n=2,
+            prefilter_min_siblings=3,
+            prefilter_keep_names={"Unclassified"},
+            embedder_factory=lambda: embedder,
+        )
+
+        self.assertEqual(embedder.queries, ["query"])
+        self.assertEqual(embedder.assertion, ("query", 2, {"Unclassified"}))
+        self.assertEqual(len(ranker.documents), 2)
+        self.assertEqual(result.search_mode, "prefiltered")
+        self.assertEqual(result.omitted_candidates, 2)
+        self.assertEqual(result.path, ["Unclassified"])
+        self.assertEqual([score.index for score in result.levels[0].candidates], [0, 3])
+        self.assertAlmostEqual(sum(path.percentage for path in result.ranked_paths), 100)
+
+    def test_prefilter_is_skipped_for_narrow_levels(self):
+        roots = parse_categories({"Animals": ["Animals"], "Unclassified": ["No category fits"]})
+
+        class NoMatchRanker:
+            def score(self, query, documents, instruction):
+                return [(-3, 0), (3, 0)]
+
+        result = categorize(
+            "query", roots, NoMatchRanker(), prefilter_top_n=1,
+            embedder_factory=lambda: self.fail("embedder should not load"),
+        )
+        self.assertEqual(result.search_mode, "exact")
+        self.assertEqual(result.omitted_candidates, 0)
+
+    def test_default_prefilter_starts_at_32_siblings(self):
+        request = CategorizeRequest(query="query", categories={"A": ["description"]})
+        self.assertEqual(request.prefilter_top_n, 8)
+        self.assertEqual(request.prefilter_min_siblings, 32)
+        self.assertIn("분류불가", request.prefilter_keep_names)
+
+        class FlatRanker:
+            def score(self, query, documents, instruction):
+                return [(0, 0)] * len(documents)
+
+        class FirstEightEmbedder:
+            def encode_query(self, query):
+                return query
+
+            def select(self, query_vector, documents, names, top_n, keep_names):
+                return list(range(top_n))
+
+        for count, expected_mode in ((31, "exact"), (32, "prefiltered")):
+            roots = parse_categories({f"C{index}": ["description"] for index in range(count)})
+            result = categorize(
+                "query", roots, FlatRanker(), prefilter_top_n=request.prefilter_top_n,
+                prefilter_min_siblings=request.prefilter_min_siblings,
+                embedder_factory=lambda: FirstEightEmbedder(),
+            )
+            self.assertEqual(result.search_mode, expected_mode)
+            self.assertEqual(result.omitted_candidates, 24 if count == 32 else 0)
+
     def test_top_k_is_bounded(self):
         for top_k in (0, 11):
             with self.subTest(top_k=top_k), self.assertRaises(ValidationError):
                 CategorizeRequest(query="query", categories={"A": ["description"]}, top_k=top_k)
+
+    def test_prefilter_top_n_is_bounded(self):
+        for top_n in (0, 65):
+            with self.subTest(top_n=top_n), self.assertRaises(ValidationError):
+                CategorizeRequest(
+                    query="query", categories={"A": ["description"]},
+                    prefilter_top_n=top_n,
+                )
+
+        for minimum in (1, 65):
+            with self.subTest(minimum=minimum), self.assertRaises(ValidationError):
+                CategorizeRequest(
+                    query="query", categories={"A": ["description"]},
+                    prefilter_min_siblings=minimum,
+                )
 
 
 if __name__ == "__main__":
