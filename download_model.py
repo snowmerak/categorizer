@@ -38,12 +38,12 @@ def download_weights(repo_id, model_dir, revision, expected_size, expected_sha25
         raise RuntimeError("Model weights failed the size or SHA-256 check; retry the download")
 
 
-def download_model(repo_id, model_dir, revision, weights_size, weights_sha256):
+def download_model(repo_id, model_dir, revision, weights_size, weights_sha256, extra_patterns=()):
     snapshot_download(
         repo_id,
         revision=revision,
         local_dir=model_dir,
-        allow_patterns=["*.json", "*.model", "*.txt"],
+        allow_patterns=["*.json", "*.model", "*.txt", *extra_patterns],
     )
     download_weights(repo_id, model_dir, revision, weights_size, weights_sha256)
     print(f"Model cached at {model_dir}")

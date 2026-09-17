@@ -1,9 +1,21 @@
 import unittest
 import math
+from threading import Lock
 
 from pydantic import ValidationError
+from fastapi.testclient import TestClient
 
-from main import CategorizeRequest, ChoicesRequest, categorize, make_response, parse_categories
+from category_scoring import CategoryInputTooLong, SiblingScore
+from lfm import LfmCategoryScorer
+from main import (
+    CategorizeRequest,
+    ChoicesRequest,
+    QwenCategoryScorer,
+    categorize,
+    create_app,
+    make_response,
+    parse_categories,
+)
 
 
 class ChoicesResponseTests(unittest.TestCase):
@@ -68,7 +80,7 @@ class CategorizationTests(unittest.TestCase):
         }
         ranker = FakeRanker()
 
-        result = categorize("고양이 이야기", parse_categories(categories), ranker)
+        result = categorize("고양이 이야기", parse_categories(categories), QwenCategoryScorer(ranker))
 
         self.assertEqual(result.path, ["동물", "포유류", "고양이"])
         self.assertEqual([len(batch) for batch in ranker.batches], [2, 2, 2])
@@ -114,7 +126,7 @@ class CategorizationTests(unittest.TestCase):
             }
         )
 
-        result = categorize("query", roots, BranchRanker(), top_k=2)
+        result = categorize("query", roots, QwenCategoryScorer(BranchRanker()), top_k=2)
 
         self.assertGreater(result.levels[0].candidates[0].percentage, 50)
         self.assertEqual(result.path, ["B", "B1"])
@@ -128,7 +140,7 @@ class CategorizationTests(unittest.TestCase):
                 return [(-3, 0), (3, 0)]
 
         roots = parse_categories({"Animals": ["Animals"], "Unclassified": ["No category fits"]})
-        result = categorize("query", roots, NoMatchRanker())
+        result = categorize("query", roots, QwenCategoryScorer(NoMatchRanker()))
 
         self.assertEqual(result.path, ["Unclassified"])
         self.assertEqual(result.ranked_paths[0].path, ["Unclassified"])
@@ -162,7 +174,7 @@ class CategorizationTests(unittest.TestCase):
         result = categorize(
             "query",
             roots,
-            ranker,
+            QwenCategoryScorer(ranker),
             top_k=2,
             prefilter_top_n=2,
             prefilter_min_siblings=3,
@@ -187,7 +199,7 @@ class CategorizationTests(unittest.TestCase):
                 return [(-3, 0), (3, 0)]
 
         result = categorize(
-            "query", roots, NoMatchRanker(), prefilter_top_n=1,
+            "query", roots, QwenCategoryScorer(NoMatchRanker()), prefilter_top_n=1,
             embedder_factory=lambda: self.fail("embedder should not load"),
         )
         self.assertEqual(result.search_mode, "exact")
@@ -213,7 +225,7 @@ class CategorizationTests(unittest.TestCase):
         for count, expected_mode in ((31, "exact"), (32, "prefiltered")):
             roots = parse_categories({f"C{index}": ["description"] for index in range(count)})
             result = categorize(
-                "query", roots, FlatRanker(), prefilter_top_n=request.prefilter_top_n,
+                "query", roots, QwenCategoryScorer(FlatRanker()), prefilter_top_n=request.prefilter_top_n,
                 prefilter_min_siblings=request.prefilter_min_siblings,
                 embedder_factory=lambda: FirstEightEmbedder(),
             )
@@ -239,6 +251,117 @@ class CategorizationTests(unittest.TestCase):
                     query="query", categories={"A": ["description"]},
                     prefilter_min_siblings=minimum,
                 )
+
+
+class CategorizeApiTests(unittest.TestCase):
+    def setUp(self):
+        self.body = {
+            "query": "A cat needs food",
+            "categories": {
+                "Pets": ["Cats and dogs"],
+                "Vehicles": ["Cars and trucks"],
+            },
+        }
+
+    def test_lfm_uses_only_lfm_and_omits_qwen_fields(self):
+        class FakeLfm:
+            model_name = "LiquidAI/test-router"
+
+            def score(self, query, documents):
+                return [SiblingScore(math.log(0.8)), SiblingScore(math.log(0.2))]
+
+        app = create_app(
+            ranker_factory=lambda: self.fail("Qwen must not load"),
+            embedder_factory=lambda: self.fail("Embedding must not load"),
+            lfm_factory=FakeLfm,
+        )
+        with TestClient(app) as client:
+            response = client.post("/categorize", json={**self.body, "model": "lfm"})
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["model"], "LiquidAI/test-router")
+        self.assertEqual(result["path"], ["Pets"])
+        self.assertEqual(result["search_mode"], "exact")
+        self.assertEqual(result["omitted_candidates"], 0)
+        self.assertAlmostEqual(result["levels"][0]["candidates"][0]["percentage"], 80)
+        self.assertNotIn("yes_logit", result["levels"][0]["candidates"][0])
+
+    def test_default_qwen_uses_only_qwen_and_keeps_existing_fields(self):
+        class FakeQwen:
+            def score(self, query, documents, instruction):
+                return [(2, 0), (0, 2)]
+
+        app = create_app(
+            ranker_factory=FakeQwen,
+            lfm_factory=lambda: self.fail("LFM must not load"),
+        )
+        with TestClient(app) as client:
+            response = client.post("/categorize", json=self.body)
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["model"], "Qwen/Qwen3-Reranker-0.6B")
+        self.assertEqual(result["path"], ["Pets"])
+        self.assertIn("yes_logit", result["levels"][0]["candidates"][0])
+        self.assertIn("no_probability", result["levels"][0]["candidates"][0])
+
+    def test_lfm_rejects_qwen_prefilter_options(self):
+        app = create_app(
+            ranker_factory=lambda: self.fail("Qwen must not load"),
+            lfm_factory=lambda: self.fail("LFM must not load for invalid input"),
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/categorize",
+                json={**self.body, "model": "lfm", "prefilter_top_n": 2},
+            )
+        self.assertEqual(response.status_code, 422)
+
+    def test_lfm_input_limit_returns_422(self):
+        class TooLongLfm:
+            model_name = "LiquidAI/test-router"
+
+            def score(self, query, documents):
+                raise CategoryInputTooLong("LFM input exceeds the configured token limit")
+
+        app = create_app(lfm_factory=TooLongLfm)
+        with TestClient(app) as client:
+            response = client.post("/categorize", json={**self.body, "model": "lfm"})
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("token limit", response.json()["detail"])
+
+
+class LfmAdapterTests(unittest.TestCase):
+    def test_sorted_router_scores_map_back_to_original_category_order(self):
+        class FakeTokenizer:
+            def __call__(self, text):
+                return {"input_ids": list(range(len(text.split())))}
+
+        class FakeModel:
+            @staticmethod
+            def _prefix(routes):
+                return "Categories: " + " ".join(routes) + " Text: "
+
+            def route(self, query, routes, tokenizer):
+                return [
+                    {"route": routes[1], "score": 0.8},
+                    {"route": routes[0], "score": 0.2},
+                ]
+
+        scorer = LfmCategoryScorer.__new__(LfmCategoryScorer)
+        scorer.tokenizer = FakeTokenizer()
+        scorer.model = FakeModel()
+        scorer.max_length = 100
+        scorer.lock = Lock()
+
+        scores = scorer.score("cat", ["Cats", "Dogs"])
+        self.assertAlmostEqual(math.exp(scores[0].log_probability), 0.2)
+        self.assertAlmostEqual(math.exp(scores[1].log_probability), 0.8)
+
+        scorer.max_length = 1
+        with self.assertRaises(CategoryInputTooLong):
+            scorer.score("cat", ["Cats", "Dogs"])
 
 
 if __name__ == "__main__":

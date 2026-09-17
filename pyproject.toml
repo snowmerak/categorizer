@@ -1,7 +1,7 @@
 [project]
 name = "categorizer"
 version = "0.1.0"
-description = "Batch reranking choices API using Qwen3-Reranker-0.6B"
+description = "Local hierarchical categorization with Qwen or LFM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,7 +9,7 @@ dependencies = [
     "hf-xet>=1.6.0",
     "huggingface-hub>=0.30",
     "torch>=2.6",
-    "transformers>=4.51,<5",
+    "transformers>=5.1,<6",
     "uvicorn>=0.30",
 ]
 
@@ -20,3 +20,8 @@ torch = { index = "pytorch-cu128" }
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28",
+]

@@ -1,6 +1,5 @@
-"""Local choices and hierarchical categorization API backed by Qwen3-Reranker."""
+"""Local choices and hierarchical categorization API with selectable scorers."""
 
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import heapq
 from itertools import count
@@ -10,8 +9,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, Callable, Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+from category_scoring import CategoryInputTooLong, CategoryScorer, SiblingScore
 
 
 MODEL_DIR = Path(__file__).resolve().parent / "models" / "qwen3-reranker-0.6b"
@@ -55,6 +56,7 @@ class ChoicesResponse(BaseModel):
 class CategorizeRequest(BaseModel):
     query: str = Field(min_length=1, max_length=10_000)
     categories: dict[str, Any] = Field(min_length=1, max_length=64)
+    model: Literal["qwen", "lfm"] = "qwen"
     top_k: int = Field(default=1, ge=1, le=10)
     prefilter_top_n: int | None = Field(default=8, ge=1, le=64)
     prefilter_min_siblings: int = Field(default=32, ge=2, le=64)
@@ -63,8 +65,15 @@ class CategorizeRequest(BaseModel):
     )
 
 
-class CategoryScore(ChoiceScore):
+class CategoryScore(BaseModel):
+    index: int
+    choice: str
     description: str
+    percentage: float
+    yes_logit: float | None = None
+    no_logit: float | None = None
+    yes_probability: float | None = None
+    no_probability: float | None = None
 
 
 class CategoryLevel(BaseModel):
@@ -204,6 +213,26 @@ def make_response(query: str, choices: list[str], logits: list[tuple[float, floa
     return ChoicesResponse(query=query, model=MODEL_NAME, choices=scores)
 
 
+class QwenCategoryScorer:
+    model_name = MODEL_NAME
+
+    def __init__(self, ranker: QwenReranker):
+        self.ranker = ranker
+
+    def score(self, query: str, documents: list[str]) -> list[SiblingScore]:
+        logits = self.ranker.score(query, documents, instruction=CATEGORY_INSTRUCTION)
+        choices = make_response(query, documents, logits).choices
+        return [
+            SiblingScore(
+                log_probability=log_probability,
+                details=choice.model_dump(
+                    include={"yes_logit", "no_logit", "yes_probability", "no_probability"}
+                ),
+            )
+            for choice, log_probability in zip(choices, log_softmax_margins(logits))
+        ]
+
+
 def parse_categories(categories: dict[str, Any]) -> list[CategoryNode]:
     """Parse {name: [description, {child_name: [...]}]} into bounded nodes."""
     count = 0
@@ -255,7 +284,7 @@ def parse_categories(categories: dict[str, Any]) -> list[CategoryNode]:
 def categorize(
     query: str,
     roots: list[CategoryNode],
-    ranker: QwenReranker,
+    scorer: CategoryScorer,
     top_k: int = 1,
     prefilter_top_n: int | None = None,
     prefilter_min_siblings: int = 32,
@@ -297,26 +326,24 @@ def categorize(
             original_indices = selected_indices
             children = [children[index] for index in selected_indices]
             documents = [documents[index] for index in selected_indices]
-        logits = ranker.score(query, documents, instruction=CATEGORY_INSTRUCTION)
-        scores = make_response(
-            query,
-            documents,
-            logits,
-        ).choices
+        scores = scorer.score(query, documents)
+        if len(scores) != len(children):
+            raise ValueError("The category scorer returned an unexpected number of scores")
         scored_levels[path] = [
             CategoryScore(
-                **score.model_dump(exclude={"choice", "index"}),
                 index=original_index,
                 choice=node.name,
                 description=node.description,
+                percentage=100 * math.exp(score.log_probability),
+                **score.details,
             )
             for original_index, node, score in zip(original_indices, children, scores)
         ]
-        for node, log_probability in zip(children, log_softmax_margins(logits)):
+        for node, score in zip(children, scores):
             child_path = (*path, node.name)
             heapq.heappush(
                 frontier,
-                (-(parent_log + log_probability), next(sequence), node, child_path),
+                (-(parent_log + score.log_probability), next(sequence), node, child_path),
             )
 
     add_children((), roots, 0.0)
@@ -343,7 +370,7 @@ def categorize(
     ]
     return CategorizeResponse(
         query=query,
-        model=MODEL_NAME,
+        model=scorer.model_name,
         path=best_path,
         levels=levels,
         ranked_paths=ranked_paths,
@@ -355,15 +382,24 @@ def categorize(
 def create_app(
     ranker_factory: Callable[[], QwenReranker] = QwenReranker,
     embedder_factory: Callable[[], Any] | None = None,
+    lfm_factory: Callable[[], CategoryScorer] | None = None,
 ) -> FastAPI:
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        app.state.ranker = ranker_factory()
-        yield
-
-    app = FastAPI(title="Qwen categorizer API", lifespan=lifespan)
+    app = FastAPI(title="Categorizer API")
+    app.state.ranker = None
+    app.state.ranker_lock = Lock()
     app.state.embedder = None
     app.state.embedder_lock = Lock()
+    app.state.lfm = None
+    app.state.lfm_lock = Lock()
+
+    def get_ranker():
+        with app.state.ranker_lock:
+            if app.state.ranker is None:
+                try:
+                    app.state.ranker = ranker_factory()
+                except FileNotFoundError as error:
+                    raise HTTPException(status_code=503, detail=str(error)) from error
+            return app.state.ranker
 
     def get_embedder():
         with app.state.embedder_lock:
@@ -377,28 +413,55 @@ def create_app(
                     raise HTTPException(status_code=503, detail=str(error)) from error
             return app.state.embedder
 
-    @app.post("/choices", response_model=ChoicesResponse)
-    def rank_choices(body: ChoicesRequest, request: Request) -> ChoicesResponse:
-        return make_response(
-            body.query, body.choices, request.app.state.ranker.score(body.query, body.choices)
-        )
+    def get_lfm():
+        with app.state.lfm_lock:
+            if app.state.lfm is None:
+                from lfm import LfmCategoryScorer
 
-    @app.post("/categorize", response_model=CategorizeResponse)
-    def categorize_query(body: CategorizeRequest, request: Request) -> CategorizeResponse:
+                factory = lfm_factory or LfmCategoryScorer
+                try:
+                    app.state.lfm = factory()
+                except FileNotFoundError as error:
+                    raise HTTPException(status_code=503, detail=str(error)) from error
+            return app.state.lfm
+
+    @app.post("/choices", response_model=ChoicesResponse)
+    def rank_choices(body: ChoicesRequest) -> ChoicesResponse:
+        return make_response(body.query, body.choices, get_ranker().score(body.query, body.choices))
+
+    @app.post("/categorize", response_model=CategorizeResponse, response_model_exclude_none=True)
+    def categorize_query(body: CategorizeRequest) -> CategorizeResponse:
         try:
             roots = parse_categories(body.categories)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        return categorize(
-            body.query,
-            roots,
-            request.app.state.ranker,
-            top_k=body.top_k,
-            prefilter_top_n=body.prefilter_top_n,
-            prefilter_min_siblings=body.prefilter_min_siblings,
-            prefilter_keep_names=set(body.prefilter_keep_names),
-            embedder_factory=get_embedder,
-        )
+        if body.model == "lfm":
+            prefilter_fields = {
+                "prefilter_top_n", "prefilter_min_siblings", "prefilter_keep_names"
+            }
+            if prefilter_fields & body.model_fields_set:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Prefilter options are available only with model='qwen'",
+                )
+            scorer = get_lfm()
+            prefilter_top_n = None
+        else:
+            scorer = QwenCategoryScorer(get_ranker())
+            prefilter_top_n = body.prefilter_top_n
+        try:
+            return categorize(
+                body.query,
+                roots,
+                scorer,
+                top_k=body.top_k,
+                prefilter_top_n=prefilter_top_n,
+                prefilter_min_siblings=body.prefilter_min_siblings,
+                prefilter_keep_names=set(body.prefilter_keep_names),
+                embedder_factory=get_embedder,
+            )
+        except CategoryInputTooLong as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     return app
 
